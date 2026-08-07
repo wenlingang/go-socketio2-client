@@ -3,14 +3,166 @@ package socketio2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// TestClient_EmitBeforeConnectIsRefused guards the emit gate: a Socket.IO v2
+// server silently drops packets for a namespace it has not yet connected, so
+// emitting early must fail loudly rather than lose the event.
+func TestClient_EmitBeforeConnectIsRefused(t *testing.T) {
+	client := New(Options{Host: "https://example.com/chat"})
+
+	if err := client.Emit("join", map[string]string{"room": "lobby"}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("expected ErrNotConnected, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := client.EmitWithAck(ctx, "join", map[string]string{"room": "lobby"}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("expected ErrNotConnected from EmitWithAck, got %v", err)
+	}
+}
+
+// TestClient_SendsClientInitiatedHeartbeat pins down the Engine.IO v3
+// heartbeat direction: the CLIENT must send PING every pingInterval and the
+// server answers PONG. (Engine.IO v4 inverts this.) A client that waits for
+// a server ping instead would be dropped as dead by a v3 server.
+func TestClient_SendsClientInitiatedHeartbeat(t *testing.T) {
+	pings := make(chan struct{}, 8)
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Deliberately short pingInterval so the test stays fast.
+		if err := conn.WriteMessage(websocket.TextMessage,
+			[]byte(`0{"sid":"test-sid","pingInterval":50,"pingTimeout":2000}`)); err != nil {
+			return
+		}
+
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if string(raw) != "2" {
+				continue
+			}
+			select {
+			case pings <- struct{}{}:
+			default:
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("3")); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := New(Options{Host: server.URL})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = client.connectAndServe(ctx)
+		close(done)
+	}()
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-pings:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for client ping #%d — the client is not driving the heartbeat", i+1)
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+// TestClient_DefaultNamespaceSendsNoConnectPacket mirrors
+// socket.io-client v2's `if ('/' !== this.nsp)` guard: on the default
+// namespace the server connects the socket itself, and a client-sent
+// CONNECT would register a duplicate socket.
+func TestClient_DefaultNamespaceSendsNoConnectPacket(t *testing.T) {
+	unexpected := make(chan string, 4)
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Long pingInterval so no heartbeat traffic muddies the assertion.
+		if err := conn.WriteMessage(websocket.TextMessage,
+			[]byte(`0{"sid":"test-sid","pingInterval":30000,"pingTimeout":30000}`)); err != nil {
+			return
+		}
+		// The server is the one that connects the default namespace.
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("40")); err != nil {
+			return
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return // expected: read deadline expires with nothing sent
+			}
+			select {
+			case unexpected <- string(raw):
+			default:
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := New(Options{Host: server.URL})
+	connected := make(chan struct{})
+	var once sync.Once
+	client.OnConnect(func() { once.Do(func() { close(connected) }) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = client.connectAndServe(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server-initiated CONNECT to reach OnConnect")
+	}
+
+	select {
+	case frame := <-unexpected:
+		t.Fatalf("client sent %q on the default namespace; socket.io-client v2 sends nothing", frame)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	cancel()
+	<-done
+}
 
 // TestClient_ConnectEmitAndReceive runs a fake Socket.IO v2 server over a
 // real websocket connection and asserts that Client performs the Engine.IO
@@ -43,8 +195,20 @@ func TestClient_ConnectEmitAndReceive(t *testing.T) {
 		}
 		_, payload, _ := decodeEIOPacket(string(raw))
 		p, _ := decodeSIOPacket(payload)
-		if p.Type != sioConnect || p.Nsp != "/chat" {
+		// socket.io-client v2 appends the socket-level query to the namespace
+		// in the CONNECT packet, so the server sees /chat?apiKey=...&token=...
+		nspPath, nspQuery, _ := strings.Cut(p.Nsp, "?")
+		if p.Type != sioConnect || nspPath != "/chat" {
 			t.Errorf("unexpected connect packet: %+v", p)
+			return
+		}
+		parsedQuery, err := url.ParseQuery(nspQuery)
+		if err != nil {
+			t.Errorf("parse connect namespace query %q: %v", nspQuery, err)
+			return
+		}
+		if parsedQuery.Get("apiKey") != "demo-key" || parsedQuery.Get("token") != "test-token" {
+			t.Errorf("connect packet missing query credentials: %q", p.Nsp)
 			return
 		}
 

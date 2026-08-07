@@ -81,8 +81,10 @@ resp, err := client.EmitWithAck(ctx, "join", map[string]string{"room": "lobby"})
 - Implements the Engine.IO v3 packet types (`OPEN`/`CLOSE`/`PING`/`PONG`/`MESSAGE`/`UPGRADE`/`NOOP`)
   and Socket.IO v2 packet types (`CONNECT`/`DISCONNECT`/`EVENT`/`ACK`/`ERROR`),
   encoded/decoded exactly as `socket.io-parser`/`engine.io-parser` v2-era do.
-- Handles server-initiated ping/pong and read-deadline based liveness, since
-  in Engine.IO v3 the **server** pings and the client must respond.
+- Drives the Engine.IO v3 heartbeat correctly: the **client** sends `PING`
+  every `pingInterval` and the server answers `PONG`. (Engine.IO v4 inverts
+  this — a v4-style client that waits for a server ping gets dropped as dead
+  by a v2 server.) Any received packet also refreshes the liveness deadline.
 - Reconnects automatically with the same defaults as socket.io-client v2
   (1s initial delay, 5s max, 0.5 randomization factor, unlimited attempts by
   default), re-running the CONNECT handshake on every attempt. Your

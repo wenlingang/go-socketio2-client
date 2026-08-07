@@ -22,6 +22,11 @@ type Options struct {
 	// DialTimeout bounds the websocket handshake. Defaults to 15s.
 	DialTimeout time.Duration
 
+	// WriteTimeout bounds a single packet write. Defaults to 10s. It stops a
+	// peer that has stopped reading from blocking writes (and therefore every
+	// concurrent Emit) indefinitely.
+	WriteTimeout time.Duration
+
 	// ReconnectionDelay is the initial delay before the first reconnect
 	// attempt. Defaults to 1s, matching socket.io-client v2.
 	ReconnectionDelay time.Duration
@@ -52,6 +57,13 @@ func (o Options) dialTimeout() time.Duration {
 		return o.DialTimeout
 	}
 	return 15 * time.Second
+}
+
+func (o Options) writeTimeout() time.Duration {
+	if o.WriteTimeout > 0 {
+		return o.WriteTimeout
+	}
+	return 10 * time.Second
 }
 
 func (o Options) reconnectionDelay() time.Duration {

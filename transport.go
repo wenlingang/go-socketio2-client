@@ -52,26 +52,44 @@ func buildWebsocketURL(opts Options) (wsURL, nsp string, err error) {
 	return u.String(), nsp, nil
 }
 
+// connectNamespace builds the namespace string for the Socket.IO CONNECT
+// packet. socket.io-client v2 appends the socket-level query to the
+// namespace before encoding it (socket.io-client/lib/manager.js:
+// `if (packet.query && packet.type === 0) packet.nsp += '?' + packet.query`),
+// so a server that reads credentials off the namespace query sees the same
+// thing the JS client would have sent.
+func connectNamespace(nsp string, query map[string]string) string {
+	if len(query) == 0 || nsp == "/" {
+		return nsp
+	}
+	q := url.Values{}
+	for k, v := range query {
+		q.Set(k, v)
+	}
+	return nsp + "?" + q.Encode()
+}
+
 // transport wraps a websocket connection dedicated to the Engine.IO v3
 // "websocket-only" transport: every websocket frame is exactly one
 // Engine.IO packet (no polling-style batching/base64 framing involved).
 // Writes are serialized because gorilla/websocket only supports one
 // concurrent writer per connection.
 type transport struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn         *websocket.Conn
+	writeMu      sync.Mutex
+	writeTimeout time.Duration
 }
 
 // dial connects to wsURL and consumes the Engine.IO OPEN packet the server
 // sends immediately after the websocket handshake.
-func dial(ctx context.Context, wsURL string, handshakeTimeout time.Duration) (*transport, openPacket, error) {
+func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time.Duration) (*transport, openPacket, error) {
 	dialer := websocket.Dialer{HandshakeTimeout: handshakeTimeout}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w", err)
 	}
 
-	t := &transport{conn: conn}
+	t := &transport{conn: conn, writeTimeout: writeTimeout}
 
 	eType, payload, err := t.readPacket()
 	if err != nil {
@@ -100,9 +118,18 @@ func (t *transport) readPacket() (eioType, string, error) {
 	return decodeEIOPacket(string(data))
 }
 
+// writePacket serializes writes because gorilla/websocket allows only one
+// concurrent writer. The write deadline matters as much as the mutex: without
+// it a peer that stops reading would block WriteMessage forever while holding
+// writeMu, wedging every subsequent Emit on the connection.
 func (t *transport) writePacket(typ eioType, payload string) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
+	if t.writeTimeout > 0 {
+		if err := t.conn.SetWriteDeadline(time.Now().Add(t.writeTimeout)); err != nil {
+			return err
+		}
+	}
 	return t.conn.WriteMessage(websocket.TextMessage, []byte(encodeEIOPacket(typ, payload)))
 }
 

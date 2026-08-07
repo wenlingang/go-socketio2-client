@@ -36,6 +36,7 @@ type Client struct {
 	mu        sync.Mutex
 	transport *transport
 	nsp       string
+	connected bool
 
 	ackMu      sync.Mutex
 	ackCounter int
@@ -71,6 +72,11 @@ func (c *Client) OnConnect(handler func()) { c.onConnect = handler }
 func (c *Client) OnDisconnect(handler func(err error)) { c.onDisconnect = handler }
 
 // OnEvent registers the callback invoked for every received EVENT packet.
+//
+// All callbacks run synchronously on the connection's read goroutine, so a
+// handler that blocks stalls delivery of every later packet. Hand slow work
+// off to your own goroutine or buffered channel. Handlers must be registered
+// before Run is called; they are not safe to swap while it is running.
 func (c *Client) OnEvent(handler EventHandler) { c.onEvent = handler }
 
 // OnError registers a callback invoked for protocol-level errors that don't
@@ -168,9 +174,15 @@ func (c *Client) emit(event string, payload any, hasAck bool, ackID int) error {
 	c.mu.Lock()
 	t := c.transport
 	nsp := c.nsp
+	connected := c.connected
 	c.mu.Unlock()
 
-	if t == nil {
+	// Emitting before the namespace CONNECT handshake completes is not just
+	// early — a Socket.IO v2 server has no socket registered for the
+	// namespace yet and silently discards the packet. Refuse instead, so the
+	// caller sees the failure rather than losing the event. Emitting from
+	// inside OnConnect is fine: the flag is set before the callback runs.
+	if t == nil || !connected {
 		return ErrNotConnected
 	}
 
@@ -212,7 +224,7 @@ func (c *Client) connectAndServe(ctx context.Context) (connected bool, err error
 		return false, err
 	}
 
-	t, open, err := dial(ctx, wsURL, c.opts.dialTimeout())
+	t, open, err := dial(ctx, wsURL, c.opts.dialTimeout(), c.opts.writeTimeout())
 	if err != nil {
 		return false, err
 	}
@@ -226,35 +238,81 @@ func (c *Client) connectAndServe(ctx context.Context) (connected bool, err error
 	defer func() {
 		c.mu.Lock()
 		c.transport = nil
+		c.connected = false
 		c.mu.Unlock()
 	}()
 
-	if err := t.writePacket(eioMessage, encodeSIOPacket(sioPacket{Type: sioConnect, Nsp: nsp})); err != nil {
-		return false, fmt.Errorf("socketio2: send connect packet: %w", err)
+	// socket.io-client v2 only sends a CONNECT packet for non-default
+	// namespaces — the server connects the client to "/" on its own
+	// (socket.io-client/lib/socket.js: `if ('/' !== this.nsp)`). Sending one
+	// anyway would register a second socket on the default namespace.
+	if nsp != "/" {
+		connectPacket := sioPacket{Type: sioConnect, Nsp: connectNamespace(nsp, c.opts.Query)}
+		if err := t.writePacket(eioMessage, encodeSIOPacket(connectPacket)); err != nil {
+			return false, fmt.Errorf("socketio2: send connect packet: %w", err)
+		}
 	}
 
+	pingInterval := time.Duration(open.PingInterval) * time.Millisecond
+	if pingInterval <= 0 {
+		pingInterval = 25 * time.Second
+	}
 	pingTimeout := time.Duration(open.PingTimeout) * time.Millisecond
 	if pingTimeout <= 0 {
-		pingTimeout = 60 * time.Second
+		pingTimeout = 20 * time.Second
 	}
-	_ = t.setReadDeadline(time.Now().Add(pingTimeout))
+	// Engine.IO v3 liveness: *any* received packet counts as a heartbeat and
+	// the connection is considered dead after pingInterval+pingTimeout of
+	// silence (engine.io-client/lib/socket.js: onHeartbeat).
+	liveness := pingInterval + pingTimeout
+
+	// In Engine.IO v3 the CLIENT drives the heartbeat: it sends PING every
+	// pingInterval and the server answers PONG
+	// (engine.io-client/lib/socket.js: setPing/ping). This is inverted in
+	// Engine.IO v4, where the server pings. Without this the server sees an
+	// idle client and closes the connection.
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := t.writePacket(eioPing, ""); err != nil {
+					_ = t.close() // unblock the read loop so Run can reconnect
+					return
+				}
+			case <-ctx.Done():
+				_ = t.close() // shut down now instead of waiting for the read deadline
+				return
+			case <-stopHeartbeat:
+				return
+			}
+		}
+	}()
+
+	_ = t.setReadDeadline(time.Now().Add(liveness))
 
 	for {
-		if ctx.Err() != nil {
-			return connected, ctx.Err()
-		}
-
 		eType, payload, err := t.readPacket()
 		if err != nil {
+			if ctx.Err() != nil {
+				return connected, ctx.Err()
+			}
 			return connected, err
 		}
+		_ = t.setReadDeadline(time.Now().Add(liveness))
 
 		switch eType {
 		case eioPing:
+			// Engine.IO v3 servers don't ping, but answering keeps this client
+			// usable against a v4-style server too.
 			if err := t.writePacket(eioPong, payload); err != nil {
 				return connected, fmt.Errorf("socketio2: send pong: %w", err)
 			}
-			_ = t.setReadDeadline(time.Now().Add(pingTimeout))
+		case eioPong:
+			// Heartbeat acknowledged; the read deadline was already extended.
 		case eioClose:
 			return connected, errors.New("socketio2: server sent close packet")
 		case eioMessage:
@@ -273,6 +331,11 @@ func (c *Client) connectAndServe(ctx context.Context) (connected bool, err error
 			case sioConnect:
 				if !connected {
 					connected = true
+					// Open the emit gate before the callback so handlers can
+					// emit their subscribe/join packets from OnConnect.
+					c.mu.Lock()
+					c.connected = true
+					c.mu.Unlock()
 					if c.onConnect != nil {
 						c.onConnect()
 					}
