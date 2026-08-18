@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,9 +87,9 @@ type transport struct {
 // sends immediately after the websocket handshake.
 func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time.Duration) (*transport, openPacket, error) {
 	dialer := websocket.Dialer{HandshakeTimeout: handshakeTimeout}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
-		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w", err)
+		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w%s", err, handshakeDetail(resp))
 	}
 
 	t := &transport{conn: conn, writeTimeout: writeTimeout}
@@ -108,6 +111,19 @@ func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time
 	}
 
 	return t, open, nil
+}
+
+// handshakeDetail renders the HTTP response a failed handshake got back.
+// gorilla's ErrBadHandshake alone can't distinguish a 403 (source IP not
+// whitelisted) from a 400 (bad params) or a proxy that ate the Upgrade, so
+// the status line and a bounded body excerpt go into the error.
+func handshakeDetail(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Sprintf(" (HTTP %s: %s)", resp.Status, strings.TrimSpace(string(body)))
 }
 
 func (t *transport) readPacket() (eioType, string, error) {
