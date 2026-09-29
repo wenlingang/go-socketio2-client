@@ -2,6 +2,7 @@ package socketio2
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -34,5 +35,32 @@ func TestDial_BadHandshakeIncludesStatusAndBody(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("dial error should contain %q, got: %v", want, err)
 		}
+	}
+
+	var hsErr *HandshakeError
+	if !errors.As(err, &hsErr) {
+		t.Fatalf("dial error should be a *HandshakeError, got: %T", err)
+	}
+	if hsErr.StatusCode != http.StatusForbidden {
+		t.Errorf("StatusCode = %d, want %d", hsErr.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestDial_NetworkFailureIsNotHandshakeError keeps callers from mistaking an
+// unreachable server for a rejected credential.
+func TestDial_NetworkFailureIsNotHandshakeError(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/socket.io/?EIO=3&transport=websocket"
+	server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, err := dial(ctx, wsURL, time.Second, time.Second)
+	if err == nil {
+		t.Fatal("expected dial to fail against a closed server")
+	}
+	var hsErr *HandshakeError
+	if errors.As(err, &hsErr) {
+		t.Errorf("network failure should not be a *HandshakeError, got: %v", err)
 	}
 }

@@ -89,7 +89,10 @@ func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time
 	dialer := websocket.Dialer{HandshakeTimeout: handshakeTimeout}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
-		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w%s", err, handshakeDetail(resp))
+		if resp != nil {
+			return nil, openPacket{}, newHandshakeError(resp, err)
+		}
+		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w", err)
 	}
 
 	t := &transport{conn: conn, writeTimeout: writeTimeout}
@@ -113,17 +116,34 @@ func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time
 	return t, open, nil
 }
 
-// handshakeDetail renders the HTTP response a failed handshake got back.
-// gorilla's ErrBadHandshake alone can't distinguish a 403 (source IP not
-// whitelisted) from a 400 (bad params) or a proxy that ate the Upgrade, so
-// the status line and a bounded body excerpt go into the error.
-func handshakeDetail(resp *http.Response) string {
-	if resp == nil {
-		return ""
-	}
+// HandshakeError reports that the server answered the websocket upgrade with
+// a non-101 HTTP response. gorilla's ErrBadHandshake alone can't distinguish
+// a 403 (source IP not whitelisted) from a 400 (bad params) or a proxy that
+// ate the Upgrade, so the status and a bounded body excerpt are kept; callers
+// can use errors.As to tell a rejected credential (401/403), which retrying
+// won't fix, apart from a transient network failure.
+type HandshakeError struct {
+	StatusCode int
+	Status     string
+	Body       string
+	Err        error
+}
+
+func (e *HandshakeError) Error() string {
+	return fmt.Sprintf("socketio2: dial websocket: %v (HTTP %s: %s)", e.Err, e.Status, e.Body)
+}
+
+func (e *HandshakeError) Unwrap() error { return e.Err }
+
+func newHandshakeError(resp *http.Response, err error) *HandshakeError {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	return fmt.Sprintf(" (HTTP %s: %s)", resp.Status, strings.TrimSpace(string(body)))
+	return &HandshakeError{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+		Body:       strings.TrimSpace(string(body)),
+		Err:        err,
+	}
 }
 
 func (t *transport) readPacket() (eioType, string, error) {
