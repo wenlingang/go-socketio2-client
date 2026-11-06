@@ -27,6 +27,14 @@ type Options struct {
 	// concurrent Emit) indefinitely.
 	WriteTimeout time.Duration
 
+	// MaxMessageBytes caps the size of a single websocket frame read from the
+	// server, Engine.IO / Socket.IO framing included. A larger frame closes
+	// the connection with websocket.ErrReadLimit (reported via OnDisconnect,
+	// testable with errors.Is) before it is buffered, so a misbehaving server
+	// cannot exhaust memory with one oversized message. Zero (the default)
+	// means no limit.
+	MaxMessageBytes int64
+
 	// ReconnectionDelay is the initial delay before the first reconnect
 	// attempt. Defaults to 1s, matching socket.io-client v2.
 	ReconnectionDelay time.Duration

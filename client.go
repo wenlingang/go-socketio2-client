@@ -224,7 +224,7 @@ func (c *Client) connectAndServe(ctx context.Context) (connected bool, err error
 		return false, err
 	}
 
-	t, open, err := dial(ctx, wsURL, c.opts.dialTimeout(), c.opts.writeTimeout())
+	t, open, err := dial(ctx, wsURL, c.opts.dialTimeout(), c.opts.writeTimeout(), c.opts.MaxMessageBytes)
 	if err != nil {
 		return false, err
 	}

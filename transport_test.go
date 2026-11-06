@@ -27,7 +27,7 @@ func TestDial_BadHandshakeIncludesStatusAndBody(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, _, err := dial(ctx, wsURL, time.Second, time.Second)
+	_, _, err := dial(ctx, wsURL, time.Second, time.Second, 0)
 	if err == nil {
 		t.Fatal("expected dial to fail against a 403 response")
 	}
@@ -55,7 +55,7 @@ func TestDial_NetworkFailureIsNotHandshakeError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, _, err := dial(ctx, wsURL, time.Second, time.Second)
+	_, _, err := dial(ctx, wsURL, time.Second, time.Second, 0)
 	if err == nil {
 		t.Fatal("expected dial to fail against a closed server")
 	}

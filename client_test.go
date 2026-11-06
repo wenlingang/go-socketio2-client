@@ -309,3 +309,61 @@ func TestClient_ConnectEmitAndReceive(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestClient_MaxMessageBytesDropsConnectionOnOversizedFrame guards against a
+// server exhausting memory with a single huge frame: with MaxMessageBytes set,
+// frames within the limit are still delivered, and an oversized one ends the
+// connection with websocket.ErrReadLimit instead of being buffered.
+func TestClient_MaxMessageBytesDropsConnectionOnOversizedFrame(t *testing.T) {
+	const limit = 1024
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		frames := []string{
+			`0{"sid":"test-sid","pingInterval":30000,"pingTimeout":30000}`,
+			"40",
+			`42["message","small"]`,
+			`42["message","` + strings.Repeat("x", limit) + `"]`,
+		}
+		for _, f := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(f)); err != nil {
+				return
+			}
+		}
+		time.Sleep(time.Second)
+	}))
+	defer server.Close()
+
+	client := New(Options{Host: server.URL, MaxMessageBytes: limit})
+	var mu sync.Mutex
+	var got []string
+	client.OnEvent(func(event string, args []json.RawMessage) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, a := range args {
+			got = append(got, string(a))
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	connected, err := client.connectAndServe(ctx)
+	if !connected {
+		t.Fatalf("expected the handshake to succeed before the oversized frame, err: %v", err)
+	}
+	if !errors.Is(err, websocket.ErrReadLimit) {
+		t.Fatalf("expected websocket.ErrReadLimit, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != `"small"` {
+		t.Fatalf("expected only the in-limit event to be delivered, got %v", got)
+	}
+}

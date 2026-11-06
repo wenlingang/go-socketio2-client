@@ -89,6 +89,9 @@ resp, err := client.EmitWithAck(ctx, "join", map[string]string{"room": "lobby"})
   (1s initial delay, 5s max, 0.5 randomization factor, unlimited attempts by
   default), re-running the CONNECT handshake on every attempt. Your
   `OnConnect` callback is the place to redo any subscribe/join emits.
+- `MaxMessageBytes` caps a single frame from the server (framing included);
+  an oversized frame drops the connection with `websocket.ErrReadLimit`
+  before it is buffered. Zero means no limit.
 - Does **not** implement HTTP long-polling, binary/ArrayBuffer packets, or
   multiplexed namespaces on a single connection — one `Client` is one
   namespace, one websocket connection.

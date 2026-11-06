@@ -84,8 +84,9 @@ type transport struct {
 }
 
 // dial connects to wsURL and consumes the Engine.IO OPEN packet the server
-// sends immediately after the websocket handshake.
-func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time.Duration) (*transport, openPacket, error) {
+// sends immediately after the websocket handshake. A positive readLimit caps
+// every frame read from the connection, the OPEN packet included.
+func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time.Duration, readLimit int64) (*transport, openPacket, error) {
 	dialer := websocket.Dialer{HandshakeTimeout: handshakeTimeout}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
@@ -95,6 +96,9 @@ func dial(ctx context.Context, wsURL string, handshakeTimeout, writeTimeout time
 		return nil, openPacket{}, fmt.Errorf("socketio2: dial websocket: %w", err)
 	}
 
+	if readLimit > 0 {
+		conn.SetReadLimit(readLimit)
+	}
 	t := &transport{conn: conn, writeTimeout: writeTimeout}
 
 	eType, payload, err := t.readPacket()
